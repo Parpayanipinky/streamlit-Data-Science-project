@@ -34,6 +34,12 @@ def resolve_project_path(*relative_paths):
 FINAL_DATA_PATH = resolve_project_path("data/final_fe_data.csv", "final_fe_data.csv")
 MODEL_READY_PATH = resolve_project_path("data/model_ready_data.csv", "model_ready_data.csv")
 MODEL_BUNDLE_PATH = resolve_project_path("models/actual_model_bundle.joblib", "actual_model_bundle.joblib")
+CLASSIFICATION_TEST_PREDICTIONS_PATH = resolve_project_path(
+    "data/classification_test_predictions.csv", "classification_test_predictions.csv"
+)
+NOTEBOOK_RESULTS_PATH = resolve_project_path(
+    "data/CURRENT_NOTEBOOK_RESULTS.json", "CURRENT_NOTEBOOK_RESULTS.json"
+)
 
 RATING_ORDER = ["A", "B", "C", "D", "E", "F", "G"]
 RATING_COLORS = {
@@ -710,9 +716,43 @@ def load_data():
     if not FINAL_DATA_PATH.exists() or not MODEL_READY_PATH.exists():
         st.error("Actual project data files are missing. Please add final_fe_data.csv and model_ready_data.csv to the data folder.")
         st.stop()
-    final_data = pd.read_csv(FINAL_DATA_PATH)
-    model_ready = pd.read_csv(MODEL_READY_PATH)
+
+    # IMPORTANT: keep_default_na=False preserves the engineered category
+    # "None" used by GLAZING_GROUP for properties with 0% multiple glazing.
+    # Pandas otherwise treats the literal word "None" as missing, which changes
+    # the trained model inputs and makes Streamlit predictions differ from Colab.
+    csv_options = {"keep_default_na": False, "na_values": [""]}
+    final_data = pd.read_csv(FINAL_DATA_PATH, **csv_options)
+    model_ready = pd.read_csv(MODEL_READY_PATH, **csv_options)
     return final_data, model_ready
+
+@st.cache_data(show_spinner=False)
+def load_notebook_test_predictions():
+    """Load the exact held-out classification predictions exported by Colab."""
+    if not CLASSIFICATION_TEST_PREDICTIONS_PATH.exists():
+        return pd.DataFrame()
+    predictions = pd.read_csv(
+        CLASSIFICATION_TEST_PREDICTIONS_PATH,
+        keep_default_na=False,
+    )
+    required = {"SOURCE_ROW_INDEX", "Actual_Rating", "Predicted_Rating", "Correct"}
+    if not required.issubset(predictions.columns):
+        return pd.DataFrame()
+    predictions["SOURCE_ROW_INDEX"] = pd.to_numeric(
+        predictions["SOURCE_ROW_INDEX"], errors="coerce"
+    ).astype("Int64")
+    predictions["Correct"] = (
+        predictions["Correct"].astype(str).str.strip().str.lower().eq("true")
+    )
+    return predictions
+
+@st.cache_data(show_spinner=False)
+def load_notebook_results():
+    """Load the canonical metrics recorded by the executed Colab notebook."""
+    if not NOTEBOOK_RESULTS_PATH.exists():
+        return {}
+    with NOTEBOOK_RESULTS_PATH.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 @st.cache_resource(show_spinner=False)
 def load_model_bundle():
@@ -722,9 +762,31 @@ def load_model_bundle():
     return joblib.load(MODEL_BUNDLE_PATH)
 
 df, model_df = load_data()
+notebook_test_predictions = load_notebook_test_predictions()
+notebook_results = load_notebook_results()
 bundle = load_model_bundle()
-metrics = bundle["metrics"]
+metrics = dict(bundle["metrics"])
 metadata = bundle["metadata"]
+
+# The executed Colab notebook is the source of truth for displayed headline
+# metrics. Keep the packaged model for interactive predictions, but always show
+# the exact held-out values exported by the notebook.
+if notebook_results:
+    class_result = notebook_results.get("classification", {})
+    reg_result = notebook_results.get("regression", {})
+    metrics.update({
+        "best_classification_model": class_result.get("Model", metrics.get("best_classification_model")),
+        "accuracy": class_result.get("Accuracy", metrics.get("accuracy")),
+        "precision_weighted": class_result.get("Precision_weighted", metrics.get("precision_weighted")),
+        "recall_weighted": class_result.get("Recall_weighted", metrics.get("recall_weighted")),
+        "weighted_f1": class_result.get("F1_weighted", metrics.get("weighted_f1")),
+        "macro_f1": class_result.get("F1_macro", metrics.get("macro_f1")),
+        "balanced_accuracy": class_result.get("Balanced_accuracy", metrics.get("balanced_accuracy")),
+        "best_regression_model": reg_result.get("Model", metrics.get("best_regression_model")),
+        "regression_r2": reg_result.get("R_squared", metrics.get("regression_r2")),
+        "regression_mae": reg_result.get("MAE", metrics.get("regression_mae")),
+        "regression_rmse": reg_result.get("RMSE", metrics.get("regression_rmse")),
+    })
 classification_model = bundle["classification_model"]
 regression_model = bundle["regression_model"]
 class_features = bundle["classification_features"]
@@ -1313,12 +1375,17 @@ def _median_or_existing(source_data, col, existing_value):
     return existing_value
 
 def build_property_type_values(base_user, property_type, month_num=None, dataset_year=None, prediction_year=None):
-    """Clone user inputs and replace the numeric baseline with medians from the actual dataset.
-    When month_num is supplied, the baseline first uses records for that same dataset month.
-    This keeps prediction graphs grounded in the uploaded data rather than hardcoded values.
+    """Build one leakage-free property-type scenario from actual Cambridge data.
+
+    The selected categorical fabric/system settings are preserved. Approved
+    independent numerical predictors use property-type and period medians when
+    available, matching the original dashboard's dataset-grounded comparison.
+    EPC outputs such as energy consumption, CO2 and costs are retained only as
+    historical reference values for optional charts and are never model inputs.
     """
     dated, _ = get_dataset_date_view(df)
     ptype_data = dated[dated[COL_PROPERTY].astype(str) == str(property_type)].copy()
+
     if dataset_year is not None and "__DATASET_YEAR" in ptype_data.columns:
         year_data = ptype_data[ptype_data["__DATASET_YEAR"].astype("Int64") == int(dataset_year)]
         if len(year_data) > 0:
@@ -1328,56 +1395,97 @@ def build_property_type_values(base_user, property_type, month_num=None, dataset
         if len(month_data) > 0:
             ptype_data = month_data
     if len(ptype_data) == 0:
+        ptype_data = dated[dated[COL_PROPERTY].astype(str) == str(property_type)].copy()
+    if len(ptype_data) == 0:
         ptype_data = dated.copy()
 
     uv = base_user.copy()
-    uv["energy_consumption"] = _median_or_existing(ptype_data, COL_ENERGY, uv.get("energy_consumption", 0))
-    uv["co2_emissions"]      = _median_or_existing(ptype_data, COL_CO2, uv.get("co2_emissions", 0))
-    uv["co2_per_floor"]      = _median_or_existing(ptype_data, COL_CO2_PER, uv.get("co2_per_floor", 0))
-    uv["heating_cost"]       = _median_or_existing(ptype_data, COL_HEATING, uv.get("heating_cost", 0))
-    uv["hot_water_cost"]     = _median_or_existing(ptype_data, COL_HOT_WATER, uv.get("hot_water_cost", 0))
-    uv["lighting_cost"]      = _median_or_existing(ptype_data, COL_LIGHTING, uv.get("lighting_cost", 0))
-    uv["floor_area"]         = _median_or_existing(ptype_data, COL_AREA, uv.get("floor_area", 0))
-    uv["environment_impact"] = _median_or_existing(ptype_data, "ENVIRONMENT_IMPACT_CURRENT", uv.get("environment_impact", 0))
-    uv["low_energy_lighting"] = _median_or_existing(ptype_data, "LOW_ENERGY_LIGHTING", uv.get("low_energy_lighting", 0))
-    uv["property_type"]      = str(property_type)
+    uv["PROPERTY_TYPE"] = str(property_type)
+    uv["property_type"] = str(property_type)
+
+    # Approved physical/structural numerical predictors only.
+    numeric_aliases = {
+        "TOTAL_FLOOR_AREA": "floor_area",
+        "FLOOR_LEVEL": "floor_level",
+        "MULTI_GLAZE_PROPORTION": "multi_glaze",
+        "EXTENSION_COUNT": "extension_count",
+        "NUMBER_HABITABLE_ROOMS": "habitable_rooms",
+        "NUMBER_HEATED_ROOMS": "heated_rooms",
+        "LOW_ENERGY_LIGHTING": "low_energy_lighting",
+        "NUMBER_OPEN_FIREPLACES": "open_fireplaces",
+        "WIND_TURBINE_COUNT": "wind_turbine_count",
+        "FLOOR_HEIGHT": "floor_height",
+        "PHOTO_SUPPLY": "photo_supply",
+        "FIXED_LIGHTING_OUTLETS_COUNT": "fixed_lighting_outlets",
+    }
+    for feature, alias in numeric_aliases.items():
+        existing = uv.get(feature, uv.get(alias, metadata.get("defaults", {}).get(feature, 0)))
+        value = _median_or_existing(ptype_data, feature, existing)
+        uv[feature] = value
+        uv[alias] = value
+
+    # Historical references for visual context only; never passed to the model.
+    reference_columns = {
+        "reference_energy_consumption": COL_ENERGY,
+        "reference_co2_emissions": COL_CO2,
+        "reference_heating_cost": COL_HEATING,
+        "reference_hot_water_cost": COL_HOT_WATER,
+        "reference_lighting_cost": COL_LIGHTING,
+    }
+    for key, column in reference_columns.items():
+        uv[key] = _median_or_existing(ptype_data, column, np.nan)
+
     if prediction_year is not None:
-        uv["inspection_year"] = float(prediction_year)
+        uv["planning_year"] = int(prediction_year)
     return uv
 
 def make_future_user_values(user, prediction_year=None, prediction_month=None):
-    """Future prediction input: preserve the user's selected building values and set the future year.
-    The property-type line graphs use dataset medians by property type/month for comparison.
+    """Return a planning scenario without inventing time-dependent model inputs.
+
+    The current notebook model contains no year or month predictor. The selected
+    year therefore labels the planning horizon; it does not force an automatic
+    score increase or decrease.
     """
     future = user.copy()
     if prediction_year is not None:
-        future["inspection_year"] = float(prediction_year)
+        future["planning_year"] = int(prediction_year)
+    if prediction_month is not None:
+        future["planning_month"] = int(prediction_month)
     return future
 
-def property_wave_chart(base_user, month_labels, metric_key, metric_label, title, pred_year, color_override=None):
-    """Smooth line chart: dataset property types × selected 3 months for a predicted metric."""
+def property_wave_chart(base_user, month_labels, metric_key, metric_label, title, pred_year, color_override=None, property_types=None):
+    """Line chart across selected property types and three planning months.
+
+    EPC score values come from the leakage-free regression model. Energy, CO2
+    and cost series are historical Cambridge medians supplied only as reference.
+    """
     fig = go.Figure()
     month_nums = st.session_state.get("pred_month_nums", [1, 2, 3])
-    for ptype in PROPERTY_TYPES_4:
+    active_types = list(property_types or PROPERTY_TYPES_4)
+
+    reference_key_map = {
+        "energy_consumption": "reference_energy_consumption",
+        "heating_cost": "reference_heating_cost",
+        "co2_emissions": "reference_co2_emissions",
+        "hot_water_cost": "reference_hot_water_cost",
+        "lighting_cost": "reference_lighting_cost",
+    }
+
+    for ptype in active_types:
         y_vals = []
         for month_num in month_nums:
-            monthly_user = build_property_type_values(base_user, ptype, month_num=month_num, prediction_year=pred_year)
-            _, reg_row = build_model_input(monthly_user)
-            score = float(np.clip(regression_model.predict(reg_row)[0], 1, 100))
+            monthly_user = build_property_type_values(
+                base_user,
+                ptype,
+                month_num=month_num,
+                prediction_year=pred_year,
+            )
             if metric_key == "efficiency_score":
-                y_vals.append(round(score, 2))
-            elif metric_key == "heating_cost":
-                y_vals.append(round(monthly_user["heating_cost"], 2))
-            elif metric_key == "co2_emissions":
-                y_vals.append(round(monthly_user["co2_emissions"], 2))
-            elif metric_key == "energy_consumption":
-                y_vals.append(round(monthly_user["energy_consumption"], 2))
-            elif metric_key == "hot_water_cost":
-                y_vals.append(round(monthly_user["hot_water_cost"], 2))
-            elif metric_key == "lighting_cost":
-                y_vals.append(round(monthly_user["lighting_cost"], 2))
+                _, reg_row = build_model_input(monthly_user)
+                value = float(np.clip(regression_model.predict(reg_row)[0], 1, 100))
             else:
-                y_vals.append(round(score, 2))
+                value = monthly_user.get(reference_key_map.get(metric_key, ""), np.nan)
+            y_vals.append(round(float(value), 2) if pd.notna(value) else np.nan)
 
         color = color_override or PROPERTY_LINE_COLORS.get(ptype, DASHBOARD_PROPERTY_COLORS[0])
         fig.add_trace(go.Scatter(
@@ -1385,42 +1493,28 @@ def property_wave_chart(base_user, month_labels, metric_key, metric_label, title
             y=y_vals,
             name=str(ptype),
             mode="lines+markers",
-            line=dict(color=color, width=3, shape="spline", smoothing=1.3),
+            connectgaps=True,
+            line=dict(color=color, width=3, shape="spline", smoothing=1.2),
             marker=dict(size=9, color=color, line=dict(color="white", width=2)),
             hovertemplate=f"<b>{ptype}</b><br>%{{x}}<br>{metric_label}: %{{y:.2f}}<extra></extra>",
         ))
 
     fig.update_layout(
-        title=dict(text=f"{title} — {pred_year}", font=dict(size=14, color="#1E1B4B", weight="bold"), x=0.02),
+        title=dict(text=f"{title} — {pred_year}", font=dict(size=14, color="#1E1B4B"), x=0.02),
         legend=dict(
-            orientation="h",
-            yanchor="bottom", y=-0.30,
+            orientation="h", yanchor="bottom", y=-0.30,
             xanchor="center", x=0.5,
             bgcolor="rgba(255,255,255,0.9)",
-            bordercolor="rgba(109,40,217,.14)",
-            borderwidth=1,
-            font=dict(size=12, color="#1E1B4B"),
-            itemsizing="constant",
+            bordercolor="rgba(109,40,217,.14)", borderwidth=1,
+            font=dict(size=12, color="#1E1B4B"), itemsizing="constant",
         ),
         height=420,
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(color="#1E1B4B", family="Inter, Segoe UI, sans-serif"),
-        margin=dict(l=50, r=30, t=52, b=100),
-        hovermode="x unified",
+        margin=dict(l=50, r=30, t=52, b=100), hovermode="x unified",
     )
-    fig.update_xaxes(
-        title_text="Month (selected 3-month range)",
-        gridcolor="rgba(109,40,217,.07)",
-        zerolinecolor="rgba(109,40,217,.12)",
-        tickfont=dict(size=12, color="#5B4B8A"),
-    )
-    fig.update_yaxes(
-        title_text=metric_label,
-        gridcolor="rgba(109,40,217,.07)",
-        zerolinecolor="rgba(109,40,217,.12)",
-        tickfont=dict(size=11, color="#5B4B8A"),
-    )
+    fig.update_xaxes(title_text="Selected three-month planning range", gridcolor="rgba(109,40,217,.07)")
+    fig.update_yaxes(title_text=metric_label, gridcolor="rgba(109,40,217,.07)")
     return fig
 
 def create_prediction_graphs(current_score, future_score, current_rating, future_rating, user, future_user, mode="future"):
@@ -1442,13 +1536,11 @@ def create_prediction_graphs(current_score, future_score, current_rating, future
     ]
 
 
-def property_type_prediction_summary(base_user, month_num=None, dataset_year=None, prediction_year=None):
-    """Predict EPC results for every property type available in the uploaded dataset.
-    Current mode can pass dataset_year + month_num so the values are grounded in the selected dataset period.
-    Future mode passes prediction_year so the selected future year is fed into the model.
-    """
+def property_type_prediction_summary(base_user, month_num=None, dataset_year=None, prediction_year=None, property_types=None):
+    """Predict EPC band and efficiency score for selected property types."""
     rows = []
-    for ptype in PROPERTY_TYPES_4:
+    active_types = list(property_types or PROPERTY_TYPES_4)
+    for ptype in active_types:
         p_user = build_property_type_values(
             base_user,
             ptype,
@@ -1473,7 +1565,6 @@ def property_type_prediction_summary(base_user, month_num=None, dataset_year=Non
             "Confidence": round(confidence * 100, 1) if not np.isnan(confidence) else np.nan,
         })
     return pd.DataFrame(rows)
-
 
 def render_property_type_rating_cards(summary_df, title):
     """Render one EPC result card for each property type, matching the reference style."""
@@ -1664,68 +1755,77 @@ def render_compact_result_cards(summary_df, title):
             )
 
 
-def calculate_selected_period_accuracy(period_data):
-    """Calculate dynamic accuracy for the selected dataset year/month.
-    This does not replace the overall test-set accuracy. It evaluates the saved
-    classifier on the records currently filtered by the user's selected period.
+def selected_period_prediction_details(period_data):
+    """Return exact Colab held-out predictions for records in a selected period.
+
+    Only the 1,000 held-out test records are used. This keeps every displayed
+    accuracy, report and confusion matrix aligned with the executed notebook;
+    training records are never mixed into evaluation results.
     """
     try:
         if period_data is None or period_data.empty:
-            return np.nan, 0
-        if COL_CURRENT not in period_data.columns:
-            return np.nan, 0
-        if model_df is None or len(model_df) == 0:
-            return np.nan, 0
-
-        # Keep row alignment between final_fe_data.csv and model_ready_data.csv.
-        valid_idx = [idx for idx in period_data.index if idx in model_df.index]
-        if not valid_idx:
-            return np.nan, 0
-
-        usable_features = [c for c in class_features if c in model_df.columns]
-        if len(usable_features) != len(class_features):
-            return np.nan, 0
-
-        X_period = model_df.loc[valid_idx, usable_features].copy()
-        actual = period_data.loc[valid_idx, COL_CURRENT].astype(str).values
-        predicted_raw = classification_model.predict(X_period)
-        predicted = [normalise_rating_prediction(x) for x in predicted_raw]
-        accuracy = float(np.mean(np.array(predicted) == actual))
-        return accuracy, len(valid_idx)
-    except Exception:
-        return np.nan, 0
-
-
-def selected_period_accuracy_table(period_data):
-    """Return per-rating accuracy table for optional review."""
-    try:
-        if period_data is None or period_data.empty or COL_CURRENT not in period_data.columns:
             return pd.DataFrame()
-        valid_idx = [idx for idx in period_data.index if idx in model_df.index]
-        usable_features = [c for c in class_features if c in model_df.columns]
-        if not valid_idx or len(usable_features) != len(class_features):
+        if notebook_test_predictions is None or notebook_test_predictions.empty:
             return pd.DataFrame()
-        X_period = model_df.loc[valid_idx, usable_features].copy()
-        actual = period_data.loc[valid_idx, COL_CURRENT].astype(str).values
-        predicted_raw = classification_model.predict(X_period)
-        predicted = np.array([normalise_rating_prediction(x) for x in predicted_raw])
-        out = pd.DataFrame({"Actual Rating": actual, "Predicted Rating": predicted})
-        out["Correct"] = out["Actual Rating"] == out["Predicted Rating"]
-        summary = out.groupby("Actual Rating", as_index=False).agg(
-            Records=("Actual Rating", "size"),
-            Correct=("Correct", "sum"),
+        if "SOURCE_ROW_INDEX" not in period_data.columns:
+            return pd.DataFrame()
+
+        selected_rows = period_data[["SOURCE_ROW_INDEX"]].copy()
+        selected_rows["SOURCE_ROW_INDEX"] = pd.to_numeric(
+            selected_rows["SOURCE_ROW_INDEX"], errors="coerce"
+        ).astype("Int64")
+        details = selected_rows.merge(
+            notebook_test_predictions,
+            on="SOURCE_ROW_INDEX",
+            how="inner",
+            validate="one_to_one",
         )
-        summary["Accuracy"] = (summary["Correct"] / summary["Records"] * 100).round(1).astype(str) + "%"
-        return summary.sort_values("Actual Rating")
+        if details.empty:
+            return pd.DataFrame()
+        details = details.rename(columns={
+            "Actual_Rating": "Actual Rating",
+            "Predicted_Rating": "Predicted Rating",
+        })
+        details["Actual Rating"] = details["Actual Rating"].astype(str)
+        details["Predicted Rating"] = details["Predicted Rating"].astype(str)
+        details["Correct"] = details["Actual Rating"] == details["Predicted Rating"]
+        return details[["SOURCE_ROW_INDEX", "Actual Rating", "Predicted Rating", "Correct"]]
     except Exception:
         return pd.DataFrame()
 
 
+def calculate_selected_period_accuracy(period_data):
+    """Calculate accuracy from the exact Colab held-out predictions."""
+    details = selected_period_prediction_details(period_data)
+    if details.empty:
+        return np.nan, 0
+    return float(details["Correct"].mean()), len(details)
+
+
+def selected_period_accuracy_table(period_data):
+    """Return per-rating accuracy for held-out Colab records in the period."""
+    details = selected_period_prediction_details(period_data)
+    if details.empty:
+        return pd.DataFrame()
+    summary = details.groupby("Actual Rating", as_index=False).agg(
+        Records=("Actual Rating", "size"),
+        Correct=("Correct", "sum"),
+    )
+    summary["Accuracy"] = (
+        summary["Correct"] / summary["Records"] * 100
+    ).round(1).astype(str) + "%"
+    return summary.sort_values("Actual Rating")
+
+
 def render_selected_period_accuracy_cards(period_data, period_label):
-    """Show fixed overall model accuracy beside dynamic selected-period accuracy."""
+    """Show fixed overall accuracy beside a Colab test-subset accuracy."""
     selected_acc, selected_n = calculate_selected_period_accuracy(period_data)
     selected_text = "N/A" if np.isnan(selected_acc) else f"{selected_acc:.1%}"
-    selected_note = "No matching model-ready records" if selected_n == 0 else f"{selected_n:,} records in {period_label}"
+    selected_note = (
+        "No held-out test records in this period"
+        if selected_n == 0
+        else f"{selected_n:,} held-out test records in {period_label}"
+    )
 
     acc_cols = st.columns(3)
     acc_cols[0].markdown(
@@ -1733,7 +1833,7 @@ def render_selected_period_accuracy_cards(period_data, period_label):
         <div class="kpi-card" style="border-left:4px solid #7C3AED;">
             <div class="kpi-label">Overall Test Accuracy</div>
             <div class="kpi-value" style="color:#7C3AED;">{metrics['accuracy']:.1%}</div>
-            <div class="kpi-note">Fixed held-out test-set result</div>
+            <div class="kpi-note">Exact Colab held-out test result</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1741,7 +1841,7 @@ def render_selected_period_accuracy_cards(period_data, period_label):
     acc_cols[1].markdown(
         f"""
         <div class="kpi-card" style="border-left:4px solid #059669;">
-            <div class="kpi-label">Selected Period Accuracy</div>
+            <div class="kpi-label">Selected Period Test Accuracy</div>
             <div class="kpi-value" style="color:#059669;">{selected_text}</div>
             <div class="kpi-note">{selected_note}</div>
         </div>
@@ -1751,44 +1851,20 @@ def render_selected_period_accuracy_cards(period_data, period_label):
     acc_cols[2].markdown(
         f"""
         <div class="kpi-card" style="border-left:4px solid #D97706;">
-            <div class="kpi-label">Why Selected Accuracy Changes</div>
-            <div class="kpi-value" style="font-size:1.0rem; color:#1E1B4B;">Month/year subset</div>
-            <div class="kpi-note">Different periods contain different EPC records</div>
+            <div class="kpi-label">Evaluation Basis</div>
+            <div class="kpi-value" style="font-size:1.0rem; color:#1E1B4B;">Held-out subset</div>
+            <div class="kpi-note">Uses only predictions exported by the Colab notebook</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    with st.expander("📋 Selected-period accuracy by EPC band", expanded=False):
+    with st.expander("📋 Selected-period test accuracy by EPC band", expanded=False):
         band_summary = selected_period_accuracy_table(period_data)
         if band_summary.empty:
-            st.info("Selected-period band accuracy is unavailable for this period.")
+            st.info("No held-out Colab test records are available for this period.")
         else:
             st.dataframe(band_summary, use_container_width=True, hide_index=True)
-
-
-def selected_period_prediction_details(period_data):
-    """Return actual vs predicted ratings for records in the selected period."""
-    try:
-        if period_data is None or period_data.empty or COL_CURRENT not in period_data.columns:
-            return pd.DataFrame()
-        if model_df is None or len(model_df) == 0:
-            return pd.DataFrame()
-
-        valid_idx = [idx for idx in period_data.index if idx in model_df.index]
-        usable_features = [c for c in class_features if c in model_df.columns]
-        if not valid_idx or len(usable_features) != len(class_features):
-            return pd.DataFrame()
-
-        X_period = model_df.loc[valid_idx, usable_features].copy()
-        actual = period_data.loc[valid_idx, COL_CURRENT].astype(str).values
-        predicted_raw = classification_model.predict(X_period)
-        predicted = np.array([normalise_rating_prediction(x) for x in predicted_raw])
-        out = pd.DataFrame({"Actual Rating": actual, "Predicted Rating": predicted})
-        out["Correct"] = out["Actual Rating"] == out["Predicted Rating"]
-        return out
-    except Exception:
-        return pd.DataFrame()
 
 
 def selected_period_classification_report(details_df):
@@ -1843,7 +1919,7 @@ def selected_period_confusion_matrix_chart(details_df, title):
 def render_model_selected_period_evaluation():
     """Interactive model-performance section where month/year changes selected-period accuracy."""
     st.markdown("<h3 style='margin-top:22px;'>Selected Period Evaluation</h3>", unsafe_allow_html=True)
-    st.caption("Choose a dataset month/year to evaluate the same trained classifier on that subset. This changes selected-period accuracy, not the fixed overall test accuracy.")
+    st.caption("Choose a dataset month/year to inspect the exact held-out Colab predictions in that subset. The fixed overall test accuracy remains unchanged.")
 
     dated_perf, perf_date_col = get_dataset_date_view(df)
     perf_years = get_dataset_years(df)
@@ -1874,25 +1950,25 @@ def render_model_selected_period_evaluation():
     with p3:
         st.markdown(
             f"""<div class="action-note" style="margin-top:26px;">
-            📅 Evaluating <b>{period_label}</b> using <b>{perf_date_col}</b> · <b style="color:#7C3AED;">{len(details_df):,}</b> model-ready records
+            📅 Evaluating <b>{period_label}</b> using <b>{perf_date_col}</b> · <b style="color:#7C3AED;">{len(details_df):,}</b> held-out test records
             </div>""",
             unsafe_allow_html=True,
         )
 
     e1, e2, e3 = st.columns(3)
-    e1.markdown(f"""<div class="kpi-card" style="border-left:4px solid #7C3AED;"><div class="kpi-label">Overall Test Accuracy</div><div class="kpi-value" style="color:#7C3AED;">{metrics['accuracy']:.1%}</div><div class="kpi-note">Fixed held-out test result</div></div>""", unsafe_allow_html=True)
-    e2.markdown(f"""<div class="kpi-card" style="border-left:4px solid #059669;"><div class="kpi-label">Selected Period Accuracy</div><div class="kpi-value" style="color:#059669;">{selected_text}</div><div class="kpi-note">Changes when month/year changes</div></div>""", unsafe_allow_html=True)
-    e3.markdown(f"""<div class="kpi-card" style="border-left:4px solid #D97706;"><div class="kpi-label">Difference vs Overall</div><div class="kpi-value" style="color:#D97706;">{diff_text}</div><div class="kpi-note">Selected subset compared with full test result</div></div>""", unsafe_allow_html=True)
+    e1.markdown(f"""<div class="kpi-card" style="border-left:4px solid #7C3AED;"><div class="kpi-label">Overall Test Accuracy</div><div class="kpi-value" style="color:#7C3AED;">{metrics['accuracy']:.1%}</div><div class="kpi-note">Exact Colab held-out test result</div></div>""", unsafe_allow_html=True)
+    e2.markdown(f"""<div class="kpi-card" style="border-left:4px solid #059669;"><div class="kpi-label">Selected Period Test Accuracy</div><div class="kpi-value" style="color:#059669;">{selected_text}</div><div class="kpi-note">Exact Colab test subset for this period</div></div>""", unsafe_allow_html=True)
+    e3.markdown(f"""<div class="kpi-card" style="border-left:4px solid #D97706;"><div class="kpi-label">Difference vs Overall</div><div class="kpi-value" style="color:#D97706;">{diff_text}</div><div class="kpi-note">Selected held-out subset vs full test result</div></div>""", unsafe_allow_html=True)
 
     if details_df.empty:
-        st.warning("No model-ready records are available for the selected period.")
+        st.warning("No held-out Colab test records are available for the selected period.")
         return
 
     s_left, s_right = st.columns([1.05, .95])
     with s_left:
-        st.plotly_chart(selected_period_confusion_matrix_chart(details_df, f"Selected Period Confusion Matrix — {period_label}"), use_container_width=True)
+        st.plotly_chart(selected_period_confusion_matrix_chart(details_df, f"Selected Period Test Confusion Matrix — {period_label}"), use_container_width=True)
     with s_right:
-        st.subheader("Selected Period Classification Report")
+        st.subheader("Selected Period Test Classification Report")
         report_df = selected_period_classification_report(details_df)
         st.dataframe(report_df, use_container_width=True, hide_index=True)
 
@@ -1936,10 +2012,11 @@ def current_dumbbell_chart(data, summary_df, metric_col=COL_SCORE, title="Datase
     return dashboard_plot_layout(fig, 440)
 
 
-def future_prediction_summary_table(base_user, month_nums, month_labels, pred_year):
-    """Wide future prediction table: one row per property type."""
+def future_prediction_summary_table(base_user, month_nums, month_labels, pred_year, property_types=None):
+    """Planning-scenario score table, one row per selected property type."""
     rows = []
-    for ptype in PROPERTY_TYPES_4:
+    active_types = list(property_types or PROPERTY_TYPES_4)
+    for ptype in active_types:
         scores = []
         confidences = []
         for month_num in month_nums:
@@ -2215,19 +2292,18 @@ elif page == "Prediction":
     kpi_row()
     st.write("")
     page_intro(
-        "Leakage-Free EPC Prediction",
-        "Predict an EPC band and efficiency score using the same 38 independent physical and structural predictors as the current notebook.",
+        "EPC Prediction Dashboard",
+        "Use the current notebook's 38 leakage-free physical and structural predictors, compare all property types, and review current-period and planning-scenario graphs.",
         icon="🏠",
     )
+    prediction_workflow_strip()
 
     st.markdown(
-        """
-        <div class="dashboard-note" style="border-left:5px solid #059669;">
-            <b>Current notebook model:</b> Random Forest classification + Linear Regression scoring.<br>
-            Current/potential EPC outputs, energy consumption, CO₂, costs, environmental-impact values,
-            assessment labels and target-encoded variables are <b>not</b> prediction inputs.
-        </div>
-        """,
+        """<div class="dashboard-note" style="border-left:4px solid #059669;">
+        <b>Leakage-safe prediction:</b> current/potential EPC outputs, consumption, CO2,
+        costs and environmental-impact values are not model inputs. The ten engineered
+        predictors are calculated automatically from the physical property selections.
+        </div>""",
         unsafe_allow_html=True,
     )
 
@@ -2247,56 +2323,72 @@ elif page == "Prediction":
         index = values.index(default) if default in values else 0
         return st.selectbox(label, values, index=index, key=key)
 
-    with st.form("current_notebook_prediction_form"):
-        st.markdown("<h3>1. Core property details</h3>", unsafe_allow_html=True)
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            property_type = _select_feature("Property Type", "PROPERTY_TYPE", "new_property_type")
-            built_form = _select_feature("Built Form", "BUILT_FORM", "new_built_form")
-            construction_age_band = _select_feature("Construction Age Band", "CONSTRUCTION_AGE_BAND", "new_age_band")
-        with c2:
-            main_fuel = _select_feature("Main Fuel", "MAIN_FUEL", "new_main_fuel")
-            mains_gas = _select_feature("Mains Gas Flag", "MAINS_GAS_FLAG", "new_mains_gas")
-            mechanical_ventilation = _select_feature("Mechanical Ventilation", "MECHANICAL_VENTILATION", "new_ventilation")
-        with c3:
-            glazed_type = _select_feature("Glazed Type", "GLAZED_TYPE", "new_glazed_type")
-            glazed_area = _select_feature("Glazed Area", "GLAZED_AREA", "new_glazed_area")
-            solar_flag = _select_feature("Solar Water Heating", "SOLAR_WATER_HEATING_FLAG", "new_solar")
+    # ─────────────────────────────────────────────────────────────────────
+    # SECTION 1 — PHYSICAL/STRUCTURAL INPUTS
+    # ─────────────────────────────────────────────────────────────────────
+    st.markdown(
+        """<div class="card" style="border-left:5px solid #7C3AED; padding:16px 20px; margin-bottom:10px;">
+        <div class="prediction-panel-title">
+          <div class="prediction-panel-number" style="background:linear-gradient(135deg,#7C3AED,#5B21B6);">1</div>
+          <div><h3 style="margin:0 0 2px 0;">Property Inputs</h3>
+          <p class="muted" style="margin:0;font-size:.9rem;">All property types are selected by default. Choose the physical fabric, heating and numerical characteristics used by the current notebook models.</p></div>
+        </div></div>""",
+        unsafe_allow_html=True,
+    )
 
-        with st.expander("🧱 Fabric, roof, windows and systems", expanded=True):
-            f1, f2 = st.columns(2)
-            with f1:
-                walls_description = _select_feature("Walls Description", "WALLS_DESCRIPTION", "new_walls")
-                roof_description = _select_feature("Roof Description", "ROOF_DESCRIPTION", "new_roof")
-                windows_description = _select_feature("Windows Description", "WINDOWS_DESCRIPTION", "new_windows")
-                floor_description = _select_feature("Floor Description", "FLOOR_DESCRIPTION", "new_floor_desc")
-            with f2:
-                mainheat_description = _select_feature("Main Heating Description", "MAINHEAT_DESCRIPTION", "new_mainheat")
-                mainheatcont_description = _select_feature("Heating Controls", "MAINHEATCONT_DESCRIPTION", "new_heatcontrol")
-                hotwater_description = _select_feature("Hot Water Description", "HOTWATER_DESCRIPTION", "new_hotwater")
+    available_property_types = [p for p in PROPERTY_TYPES_4 if p in _feature_options("PROPERTY_TYPE")]
+    if not available_property_types:
+        available_property_types = _feature_options("PROPERTY_TYPE")
+    selected_property_types = st.multiselect(
+        "Property Types to Compare",
+        available_property_types,
+        default=available_property_types,
+        key="prediction_property_types_all_default",
+        help="All Cambridge property types are selected by default. Remove a type only when you want a narrower comparison.",
+    )
+    if not selected_property_types:
+        st.warning("Select at least one property type to generate comparisons.")
+        st.stop()
 
-        with st.expander("📐 Independent numerical property inputs", expanded=True):
-            n1, n2, n3 = st.columns(3)
-            with n1:
-                floor_area = st.number_input("Total Floor Area (m²)", min_value=1.0, max_value=1000.0, value=float(defaults.get("TOTAL_FLOOR_AREA", 75.0)), step=1.0)
-                floor_level = st.number_input("Floor Level", min_value=0.0, max_value=100.0, value=float(defaults.get("FLOOR_LEVEL", 1.0)), step=1.0)
-                multi_glaze = st.number_input("Multi-Glaze Proportion (%)", min_value=0.0, max_value=100.0, value=float(defaults.get("MULTI_GLAZE_PROPORTION", 100.0)), step=1.0)
-                extension_count = st.number_input("Extension Count", min_value=0.0, max_value=20.0, value=float(defaults.get("EXTENSION_COUNT", 0.0)), step=1.0)
-            with n2:
-                habitable_rooms = st.number_input("Habitable Rooms", min_value=1.0, max_value=100.0, value=float(defaults.get("NUMBER_HABITABLE_ROOMS", 4.0)), step=1.0)
-                heated_rooms = st.number_input("Heated Rooms", min_value=0.0, max_value=100.0, value=float(defaults.get("NUMBER_HEATED_ROOMS", 4.0)), step=1.0)
-                low_energy_lighting = st.number_input("Low-Energy Lighting (%)", min_value=0.0, max_value=100.0, value=float(defaults.get("LOW_ENERGY_LIGHTING", 100.0)), step=1.0)
-                open_fireplaces = st.number_input("Open Fireplaces", min_value=0.0, max_value=20.0, value=float(defaults.get("NUMBER_OPEN_FIREPLACES", 0.0)), step=1.0)
-            with n3:
-                wind_turbines = st.number_input("Wind Turbine Count", min_value=0.0, max_value=20.0, value=float(defaults.get("WIND_TURBINE_COUNT", 0.0)), step=1.0)
-                floor_height = st.number_input("Floor Height (m)", min_value=1.0, max_value=10.0, value=float(defaults.get("FLOOR_HEIGHT", 2.4)), step=0.1)
-                photo_supply = st.number_input("Photovoltaic Supply", min_value=0.0, max_value=100.0, value=float(defaults.get("PHOTO_SUPPLY", 0.0)), step=0.1)
-                fixed_lighting = st.number_input("Fixed Lighting Outlets", min_value=0.0, max_value=500.0, value=float(defaults.get("FIXED_LIGHTING_OUTLETS_COUNT", 10.0)), step=1.0)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        built_form = _select_feature("Built Form", "BUILT_FORM", "pred_built_form")
+        construction_age_band = _select_feature("Construction Age Band", "CONSTRUCTION_AGE_BAND", "pred_age_band")
+        main_fuel = _select_feature("Main Fuel", "MAIN_FUEL", "pred_main_fuel")
+        mains_gas = _select_feature("Mains Gas Flag", "MAINS_GAS_FLAG", "pred_mains_gas")
+        glazed_type = _select_feature("Glazed Type", "GLAZED_TYPE", "pred_glazed_type")
+    with c2:
+        glazed_area = _select_feature("Glazed Area", "GLAZED_AREA", "pred_glazed_area")
+        walls_description = _select_feature("Walls Description", "WALLS_DESCRIPTION", "pred_walls")
+        roof_description = _select_feature("Roof Description", "ROOF_DESCRIPTION", "pred_roof")
+        windows_description = _select_feature("Windows Description", "WINDOWS_DESCRIPTION", "pred_windows")
+        floor_description = _select_feature("Floor Description", "FLOOR_DESCRIPTION", "pred_floor_desc")
+    with c3:
+        mainheat_description = _select_feature("Main Heating Description", "MAINHEAT_DESCRIPTION", "pred_mainheat")
+        mainheatcont_description = _select_feature("Heating Controls", "MAINHEATCONT_DESCRIPTION", "pred_heat_controls")
+        hotwater_description = _select_feature("Hot Water Description", "HOTWATER_DESCRIPTION", "pred_hotwater")
+        mechanical_ventilation = _select_feature("Mechanical Ventilation", "MECHANICAL_VENTILATION", "pred_ventilation")
+        solar_flag = _select_feature("Solar Water Heating", "SOLAR_WATER_HEATING_FLAG", "pred_solar")
 
-        submitted = st.form_submit_button("⚡ Generate EPC Prediction", use_container_width=True)
+    with st.expander("📐 Independent numerical property inputs", expanded=False):
+        n1, n2, n3 = st.columns(3)
+        with n1:
+            floor_area = smart_numeric_widget("Total Floor Area (m²)", "TOTAL_FLOOR_AREA", key="pred_floor_area")
+            floor_level = smart_numeric_widget("Floor Level", "FLOOR_LEVEL", key="pred_floor_level")
+            multi_glaze = smart_numeric_widget("Multi-Glaze Proportion (%)", "MULTI_GLAZE_PROPORTION", key="pred_multi_glaze")
+            extension_count = smart_numeric_widget("Extension Count", "EXTENSION_COUNT", key="pred_extension", integer=True)
+        with n2:
+            habitable_rooms = smart_numeric_widget("Habitable Rooms", "NUMBER_HABITABLE_ROOMS", key="pred_habitable", integer=True)
+            heated_rooms = smart_numeric_widget("Heated Rooms", "NUMBER_HEATED_ROOMS", key="pred_heated", integer=True)
+            low_energy_lighting = smart_numeric_widget("Low-Energy Lighting (%)", "LOW_ENERGY_LIGHTING", key="pred_low_lighting")
+            open_fireplaces = smart_numeric_widget("Open Fireplaces", "NUMBER_OPEN_FIREPLACES", key="pred_fireplaces", integer=True)
+        with n3:
+            wind_turbines = smart_numeric_widget("Wind Turbine Count", "WIND_TURBINE_COUNT", key="pred_wind", integer=True)
+            floor_height = smart_numeric_widget("Floor Height (m)", "FLOOR_HEIGHT", key="pred_floor_height")
+            photo_supply = smart_numeric_widget("Photovoltaic Supply", "PHOTO_SUPPLY", key="pred_photo")
+            fixed_lighting = smart_numeric_widget("Fixed Lighting Outlets", "FIXED_LIGHTING_OUTLETS_COUNT", key="pred_fixed_light", integer=True)
 
     user_values = {
-        "PROPERTY_TYPE": property_type,
         "BUILT_FORM": built_form,
         "CONSTRUCTION_AGE_BAND": construction_age_band,
         "MAIN_FUEL": main_fuel,
@@ -2326,43 +2418,182 @@ elif page == "Prediction":
         "FIXED_LIGHTING_OUTLETS_COUNT": fixed_lighting,
     }
 
-    if submitted:
-        class_row, reg_row = build_model_input(user_values)
-        classifier_band = normalise_rating_prediction(classification_model.predict(class_row)[0])
-        predicted_score = float(np.clip(regression_model.predict(reg_row)[0], 1, 100))
-        score_band = score_to_rating(predicted_score)
-        confidence = np.nan
-        try:
-            probabilities = classification_model.predict_proba(class_row)[0]
-            confidence = float(np.max(probabilities))
-        except Exception:
-            pass
+    # ─────────────────────────────────────────────────────────────────────
+    # SECTION 2 — CURRENT DATASET-PERIOD CALCULATION
+    # ─────────────────────────────────────────────────────────────────────
+    import datetime as _dt
+    dataset_year_options = get_dataset_years(df)
+    if not dataset_year_options:
+        st.error("No valid inspection/lodgement years were found in the dataset.")
+        st.stop()
 
-        st.markdown("<h3 style='margin-top:22px;'>2. Prediction Results</h3>", unsafe_allow_html=True)
-        r1, r2, r3, r4 = st.columns(4)
-        band_colour = RATING_COLORS.get(classifier_band, "#7C3AED")
-        r1.markdown(f"""<div class="kpi-card"><div class="kpi-label">Classifier EPC Band</div><div class="kpi-value" style="color:{band_colour};">{classifier_band}</div><div class="kpi-note">Random Forest classification</div></div>""", unsafe_allow_html=True)
-        r2.markdown(f"""<div class="kpi-card"><div class="kpi-label">Predicted Efficiency Score</div><div class="kpi-value" style="color:#059669;">{predicted_score:.1f}</div><div class="kpi-note">Linear Regression score</div></div>""", unsafe_allow_html=True)
-        r3.markdown(f"""<div class="kpi-card"><div class="kpi-label">Score-Derived Band</div><div class="kpi-value" style="color:{RATING_COLORS.get(score_band, '#7C3AED')};">{score_band}</div><div class="kpi-note">Band mapped from predicted score</div></div>""", unsafe_allow_html=True)
-        confidence_text = "N/A" if pd.isna(confidence) else f"{confidence:.1%}"
-        r4.markdown(f"""<div class="kpi-card"><div class="kpi-label">Classifier Confidence</div><div class="kpi-value" style="color:#DB2777;">{confidence_text}</div><div class="kpi-note">Maximum class probability</div></div>""", unsafe_allow_html=True)
+    st.markdown(
+        """<div class="card" style="border-left:5px solid #0891B2; padding:16px 20px; margin-top:20px; margin-bottom:8px;">
+        <div class="prediction-panel-title">
+          <div class="prediction-panel-number" style="background:linear-gradient(135deg,#0891B2,#0369A1);">2</div>
+          <div><h3 style="margin:0 0 2px 0;">Current Dataset-Period Calculation</h3>
+          <p class="muted" style="margin:0;font-size:.9rem;">Compare actual Cambridge period averages with leakage-free model predictions for every selected property type.</p></div>
+        </div></div>""",
+        unsafe_allow_html=True,
+    )
 
-        with st.expander("View the exact 38-feature model row", expanded=False):
-            display_row = class_row.T.reset_index()
-            display_row.columns = ["Model Feature", "Value"]
-            display_row["Value"] = display_row["Value"].astype(str)
-            st.dataframe(display_row, use_container_width=True, hide_index=True)
+    dc1, dc2, dc3 = st.columns([1, 1, 2])
+    with dc1:
+        insp_year = st.selectbox("Dataset Year", dataset_year_options, index=len(dataset_year_options) - 1, key="prediction_dataset_year")
+    dataset_month_options = get_dataset_months_for_year(df, insp_year) or list(MONTH_NAMES.keys())
+    with dc2:
+        insp_month = st.selectbox("Dataset Month", dataset_month_options, index=len(dataset_month_options) - 1, key="prediction_dataset_month", format_func=month_label)
+    insp_month_name = MONTH_NAMES.get(int(insp_month), str(insp_month))
+    with dc3:
+        st.markdown(
+            f"""<div class="action-note" style="margin-top:26px;">📅 Current comparison: <b>{insp_month_name} {insp_year}</b> · <b>{len(selected_property_types)}</b> selected property type(s)</div>""",
+            unsafe_allow_html=True,
+        )
 
-        st.info("This prediction is for screening and programme planning only. It does not replace a professional EPC survey.")
+    dated_current, current_date_source = get_dataset_date_view(df)
+    current_period_data = dated_current[
+        (dated_current["__DATASET_YEAR"].astype("Int64") == int(insp_year))
+        & (dated_current["__DATASET_MONTH"].astype("Int64") == int(insp_month))
+        & (dated_current[COL_PROPERTY].astype(str).isin([str(p) for p in selected_property_types]))
+    ].copy()
+
+    current_clicked = st.button("⚡ Calculate Current EPC Comparison", key="calculate_current_full", use_container_width=True)
+    if current_clicked:
+        st.session_state["show_current_full"] = True
+    if st.session_state.get("show_current_full", False):
+        current_summary_df = property_type_prediction_summary(
+            user_values,
+            month_num=insp_month,
+            dataset_year=insp_year,
+            prediction_year=insp_year,
+            property_types=selected_property_types,
+        )
+        render_selected_period_accuracy_cards(current_period_data, f"{insp_month_name} {insp_year}")
+        st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
+        render_property_type_rating_cards(current_summary_df, f"Predicted EPC Results — {insp_month_name} {insp_year}")
+
+        if not current_period_data.empty:
+            st.plotly_chart(
+                current_dumbbell_chart(
+                    current_period_data,
+                    current_summary_df,
+                    COL_SCORE,
+                    f"Actual Dataset Average vs Model Prediction — {insp_month_name} {insp_year}",
+                ),
+                use_container_width=True,
+            )
+            st.caption("Actual bars use Cambridge records for the selected period; prediction bars use the current notebook's leakage-free Linear Regression pipeline.")
+        else:
+            st.info("No actual records exist for this period and selected property types; model predictions are still shown above.")
+
+        chart_left, chart_right = st.columns(2)
+        with chart_left:
+            st.plotly_chart(property_type_confidence_by_band_chart(current_summary_df), use_container_width=True)
+        with chart_right:
+            st.plotly_chart(property_type_score_distribution_chart(current_period_data, current_summary_df, COL_SCORE, "Current Score Comparison"), use_container_width=True)
+
+        comparison_df = current_comparison_table(current_period_data, current_summary_df, COL_SCORE)
+        with st.expander("📋 Full current comparison table", expanded=True):
+            st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+
+        best_row = current_summary_df.sort_values("Efficiency Score", ascending=False).iloc[0]
+        lowest_row = current_summary_df.sort_values("Efficiency Score", ascending=True).iloc[0]
+        st.markdown(
+            f"""<div class="card" style="margin-top:12px;"><h3>Current Prediction Summary</h3>
+            <p>• Highest predicted score: <b>{best_row['Property Type']} — {best_row['Efficiency Score']:.1f} (Band {best_row['Predicted Band']})</b>.</p>
+            <p>• Lowest predicted score: <b>{lowest_row['Property Type']} — {lowest_row['Efficiency Score']:.1f} (Band {lowest_row['Predicted Band']})</b>.</p>
+            <p>• Selected-period test accuracy is a subset of the exact Colab held-out predictions and does not replace the full test accuracy of <b>{metrics['accuracy']:.1%}</b>.</p></div>""",
+            unsafe_allow_html=True,
+        )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # SECTION 3 — PLANNING SCENARIO (1–5 YEARS)
+    # ─────────────────────────────────────────────────────────────────────
+    st.markdown(
+        """<div class="card" style="border-left:5px solid #059669; padding:16px 20px; margin-top:22px; margin-bottom:8px;">
+        <div class="prediction-panel-title">
+          <div class="prediction-panel-number" style="background:linear-gradient(135deg,#059669,#047857);">3</div>
+          <div><h3 style="margin:0 0 2px 0;">Future Planning Scenario</h3>
+          <p class="muted" style="margin:0;font-size:.9rem;">Choose a 1–5 year planning horizon and three-month range. The model is not a time-series forecaster, so the year is a planning label rather than an automatic trend variable.</p></div>
+        </div></div>""",
+        unsafe_allow_html=True,
+    )
+
+    fc1, fc2, fc3 = st.columns([1, 1.3, 1.7])
+    with fc1:
+        pred_year = st.selectbox("Planning Year", PREDICTION_YEARS, index=0, key="planning_year_full", format_func=prediction_year_label)
+    with fc2:
+        quarter_labels = [q[0] for q in PREDICTION_QUARTER_RANGES]
+        pred_quarter = st.selectbox("Three-Month Range", quarter_labels, index=0, key="planning_quarter_full")
+    selected_month_nums = next(q[1] for q in PREDICTION_QUARTER_RANGES if q[0] == pred_quarter)
+    pred_month_labels = [f"{MONTH_NAMES[m]} {pred_year}" for m in selected_month_nums]
+    with fc3:
+        st.markdown(
+            f"""<div class="action-note" style="margin-top:26px;">📈 Scenario window: <b>{pred_month_labels[0]}</b> → <b>{pred_month_labels[-1]}</b><br><span style="font-size:.8rem;color:#7C6B9E;">All selected property types remain active by default.</span></div>""",
+            unsafe_allow_html=True,
+        )
+
+    st.session_state["pred_month_labels"] = pred_month_labels
+    st.session_state["pred_month_nums"] = selected_month_nums
+    st.session_state["pred_year"] = pred_year
+
+    future_clicked = st.button("📈 Generate Planning Scenario", key="generate_future_full", use_container_width=True)
+    if future_clicked:
+        st.session_state["show_future_full"] = True
+    if st.session_state.get("show_future_full", False):
+        future_values = make_future_user_values(user_values, prediction_year=pred_year, prediction_month=selected_month_nums[0])
+
+        st.plotly_chart(
+            property_wave_chart(
+                future_values,
+                pred_month_labels,
+                "efficiency_score",
+                "Predicted EPC efficiency score (0–100)",
+                "EPC Score Planning Scenario — Selected Property Types",
+                pred_year,
+                property_types=selected_property_types,
+            ),
+            use_container_width=True,
+        )
+
+        future_table = future_prediction_summary_table(
+            future_values,
+            selected_month_nums,
+            pred_month_labels,
+            pred_year,
+            property_types=selected_property_types,
+        )
+        st.markdown("<h4>Planning Scenario Summary — Selected Property Types</h4>", unsafe_allow_html=True)
+        st.dataframe(future_table, use_container_width=True, hide_index=True)
+
+        with st.expander("📊 Historical Reference Indicators — Energy, CO₂ and Costs", expanded=False):
+            st.warning("These supporting charts are historical Cambridge medians for context. They are not model inputs and are not future predictions.")
+            rg1, rg2 = st.columns(2)
+            with rg1:
+                st.plotly_chart(property_wave_chart(future_values, pred_month_labels, "energy_consumption", "Historical median energy consumption", "Historical Energy Consumption Reference", pred_year, property_types=selected_property_types), use_container_width=True)
+                st.plotly_chart(property_wave_chart(future_values, pred_month_labels, "heating_cost", "Historical median heating cost (£)", "Historical Heating Cost Reference", pred_year, property_types=selected_property_types), use_container_width=True)
+            with rg2:
+                st.plotly_chart(property_wave_chart(future_values, pred_month_labels, "co2_emissions", "Historical median CO₂ emissions", "Historical CO₂ Reference", pred_year, property_types=selected_property_types), use_container_width=True)
+                st.plotly_chart(property_wave_chart(future_values, pred_month_labels, "lighting_cost", "Historical median lighting cost (£)", "Historical Lighting Cost Reference", pred_year, property_types=selected_property_types), use_container_width=True)
+
+        scenario_best = future_table.sort_values("Average Score", ascending=False).iloc[0]
+        st.markdown(
+            f"""<div class="card" style="margin-top:12px;"><h3>Planning Scenario Summary</h3>
+            <p>• Highest average scenario score: <b>{scenario_best['Property Type']} — {scenario_best['Average Score']} (Band {scenario_best['Predicted Band']})</b>.</p>
+            <p>• The selected planning year does not itself change the prediction because year/month are not among the approved 38 predictors.</p>
+            <p>• Use this dashboard for screening and programme planning only; it does not replace a professional EPC assessment.</p></div>""",
+            unsafe_allow_html=True,
+        )
+
 
 elif page == "Interactive Dashboard":
     page_intro(
         "Current Energy Analytics Dashboard",
-        "Explore actual Cambridge EPC records by year, month, property type and EPC band. Select a property type first so every chart updates clearly for that group.",
+        "Explore actual Cambridge EPC records by year, month, property type and EPC band. All property types are selected by default, and every chart updates with the filters.",
         icon="📊",
     )
     default_metric = "Energy Efficiency Score"
-    property_placeholder = "Select property type"
+    property_placeholder = "All property types"
 
     dashboard_df, dashboard_date_col = get_dataset_date_view(df)
     available_years = get_dataset_years(df)
@@ -2400,8 +2631,8 @@ elif page == "Interactive Dashboard":
         st.session_state["dashboard_potential_epc"] = "All"
         st.session_state["dashboard_metric"] = default_metric
 
-    # Main filters: property type is intentionally not selected by default.
-    property_options = [property_placeholder, "All property types"] + get_options(COL_PROPERTY)
+    # All property types are selected by default.
+    property_options = ["All property types"] + get_options(COL_PROPERTY)
     filter_top = st.columns([.9, 1.05, 1.45, 1.25, .72])
     selected_year = filter_top[0].selectbox(
         "Year",
@@ -2430,7 +2661,7 @@ elif page == "Interactive Dashboard":
         "Property Type",
         property_options,
         key="dashboard_property_type",
-        help="Select a property type to activate the dashboard. Choose All property types for an overall comparison.",
+        help="All property types are selected by default. Choose one type for a focused comparison.",
     )
     metric_label = filter_top[3].selectbox(
         "Metric",
@@ -2446,7 +2677,7 @@ elif page == "Interactive Dashboard":
         st.markdown(
             f"""
             <div class="dashboard-note" style="margin-top:24px;">
-                <b>Dataset-only date filter:</b> using <b>{dashboard_date_col}</b>. Selected period: <b>{MONTH_NAMES.get(int(selected_month), selected_month)} {int(selected_year)}</b>. Property type must be selected before charts are shown.
+                <b>Dataset-only date filter:</b> using <b>{dashboard_date_col}</b>. Selected period: <b>{MONTH_NAMES.get(int(selected_month), selected_month)} {int(selected_year)}</b>. All property types are shown by default.
             </div>
             """,
             unsafe_allow_html=True,
@@ -2465,24 +2696,6 @@ elif page == "Interactive Dashboard":
         (dashboard_df["__DATASET_YEAR"].astype("Int64") == int(selected_year))
         & (dashboard_df["__DATASET_MONTH"].astype("Int64") == int(selected_month))
     ].copy()
-
-    if selected_property_type == property_placeholder:
-        st.markdown(
-            """
-            <div class="card" style="margin-top:18px; border-left:5px solid #7C3AED;">
-                <h3>Choose a property type to start</h3>
-                <p class="muted" style="line-height:1.6; margin-bottom:0;">
-                    This dashboard is for actual dataset exploration. Select <b>House</b>, <b>Flat</b>, <b>Bungalow</b>, <b>Maisonette</b>, or <b>All property types</b>. After selection, the EPC distribution, current vs potential ratings, metric charts and summary will update for that group.
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        demo_cols = st.columns(3)
-        demo_cols[0].markdown("<div class='card-small'><div class='small-label'>Step 1</div><b>Select property type</b><br><span class='muted'>No default type is selected.</span></div>", unsafe_allow_html=True)
-        demo_cols[1].markdown("<div class='card-small'><div class='small-label'>Step 2</div><b>Choose metric</b><br><span class='muted'>Score, CO₂, energy, cost or floor area.</span></div>", unsafe_allow_html=True)
-        demo_cols[2].markdown("<div class='card-small'><div class='small-label'>Step 3</div><b>Read graphs</b><br><span class='muted'>Charts update only for the selected group.</span></div>", unsafe_allow_html=True)
-        st.stop()
 
     property_filter = "All" if selected_property_type == "All property types" else selected_property_type
     filtered = apply_filters(period_data, property_filter, current_filter, potential_filter)

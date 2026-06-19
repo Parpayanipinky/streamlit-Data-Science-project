@@ -1,6 +1,6 @@
 # Cambridge Energy Rating Predictor — Current Notebook Results
 
-This package keeps the original Streamlit visual design while synchronising the entire website with `FINAL_READY_FILE_NO_MISSING_CLEANING(6).ipynb`.
+This package keeps the original Streamlit visual design while synchronising the website with the uploaded Colab notebook `Final_notebook_by_pinky.ipynb`. Its 28 code cells and all saved code-cell outputs are identical to the bundled source notebook `FINAL_READY_FILE_NO_MISSING_CLEANING(6).ipynb`.
 
 ## Run locally
 
@@ -32,6 +32,15 @@ Cambridge_EPC_Final_Code/APP/app.py
 - MAE: **3.3244**
 - RMSE: **4.9398**
 
+## Colab alignment correction
+
+- CSV loading preserves the legitimate engineered category **`GLAZING_GROUP = "None"`** for 122 properties. Pandas previously interpreted that word as a missing value, which changed live model inputs.
+- Headline model metrics are loaded from `CURRENT_NOTEBOOK_RESULTS.json`, the executed notebook source of truth.
+- Month/year evaluation uses only the exact 1,000 held-out classification predictions exported from Colab; training records are not mixed into evaluation.
+- The included `validate_colab_streamlit_alignment.py` script checks notebook code/outputs, result tables, diagnostics, feature importance, model inputs, predictions and confusion matrix.
+
+The latest comparison report records **38 passed checks and 0 failures**.
+
 ## Leakage control
 
 The prediction models use only independent physical and structural property variables. Current/potential EPC outputs, energy consumption, CO₂, costs, environmental-impact outputs, assessment labels and target-encoded variables are excluded from model inputs.
@@ -42,7 +51,10 @@ The prediction models use only independent physical and structural property vari
 - The model-performance page uses the current cross-validation and held-out metrics.
 - The selected regressor is **Linear Regression**, not Random Forest Regressor.
 - The feature-importance page uses notebook permutation importance and the correct leading variables.
-- The prediction form now builds the same 38 leakage-free features as the notebook.
+- The full original three-stage Prediction dashboard is restored with current-period graphs, all-property comparison cards, planning-scenario graphs and summary tables.
+- All four property types are selected by default on Prediction and Feature Explorer, and the Interactive Dashboard opens with **All property types** selected.
+- The prediction inputs build the same 38 leakage-free features as the notebook.
+- Energy, CO₂ and cost charts in the planning section are clearly labelled as historical reference medians, not model inputs or future forecasts.
 - Recommendations and explanatory text no longer describe leakage variables as model drivers.
 - The original website layout, styling and navigation are retained.
 
