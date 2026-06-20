@@ -1,0 +1,5 @@
+PROPERTY_TYPE,Properties,Mean_Efficiency_Score,Median_Efficiency_Score,Properties_Below_C,Proportion_Below_C_Percent
+Bungalow,121,70.53,70.0,40,33.1
+Flat,1967,76.26,78.0,265,13.5
+House,2760,69.13,69.0,1274,46.2
+Maisonette,152,72.65,74.0,40,26.3

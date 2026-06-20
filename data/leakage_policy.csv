@@ -1,0 +1,6 @@
+Excluded group,Reason
+Targets,A target cannot also be an input.
+Current EPC outputs,"Consumption, impact, emissions and costs encode the EPC calculation."
+Potential EPC outputs,"Potential ratings, scores, costs and emissions are outputs of the same assessment."
+EPC Good/Poor assessment labels,These labels can re-express assessed efficiency and inflate performance.
+Target encoding,No category is encoded using the target mean.

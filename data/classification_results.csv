@@ -1,0 +1,4 @@
+Model,CV_Folds,Accuracy,Precision,Recall,F1 Score,F1 Macro,Balanced Accuracy,F1 SD,Evaluation
+Random Forest Classifier,4,0.7508,0.749,0.7508,0.7486,0.4992,0.4942,0.0128,Training cross-validation
+Logistic Regression,4,0.7408,0.7594,0.7408,0.7474,0.4702,0.5013,0.0129,Training cross-validation
+Decision Tree Classifier,4,0.653,0.6977,0.653,0.6696,0.4495,0.5636,0.0152,Training cross-validation

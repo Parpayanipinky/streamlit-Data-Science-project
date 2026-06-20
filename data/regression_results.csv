@@ -1,0 +1,4 @@
+Model,CV_Folds,R_squared,R_squared_SD,MAE,RMSE,Evaluation
+Linear Regression,5,0.7642,0.0232,3.4039,5.11,Training cross-validation
+Random Forest Regressor,5,0.7594,0.0208,3.1407,5.1725,Training cross-validation
+Decision Tree Regressor,5,0.6335,0.0473,4.0155,6.377,Training cross-validation

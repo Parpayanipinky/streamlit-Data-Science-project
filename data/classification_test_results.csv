@@ -1,0 +1,2 @@
+Model,Test_Records,Accuracy,Precision_weighted,Recall_weighted,F1_weighted,F1_macro,Balanced_accuracy
+Random Forest Classifier,1000,0.758,0.7586,0.758,0.7576,0.5235,0.5305

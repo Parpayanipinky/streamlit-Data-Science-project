@@ -1,0 +1,5 @@
+Priority,Stakeholder,Data-grounded finding,Recommended action
+1,Cambridge City Council housing and retrofit teams,Pre-1930: 1071 properties; 740 (69.1%) below EPC C; mean score 63.5.,"Screen this age group first for fabric, glazing, ventilation and heating-system surveys."
+2,Cambridge landlords and housing associations,House: 2760 properties; 1274 (46.2%) below EPC C; mean score 69.1.,Target engagement and property-level assessments without treating property type as a direct cause.
+3,Cambridge energy programme managers,Gas: 4073 properties; 1360 (33.4%) below EPC C; mean score 71.7.,"Prioritise heating controls, system condition and fabric checks; interpret small fuel groups cautiously."
+4,Surveyors and programme analysts,"Leading held-out permutation predictors: WALLS_DESCRIPTION, ROOF_DESCRIPTION, CONSTRUCTION_AGE_GROUP, HOTWATER_DESCRIPTION, BUILT_FORM.",Use these characteristics for screening only; do not replace a qualified EPC or retrofit survey.

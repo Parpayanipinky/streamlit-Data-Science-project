@@ -1,0 +1,30 @@
+{
+  "version": "CURRENT_NOTEBOOK_EXACT_REBUILD_2026-06-17",
+  "source_notebook": "FINAL_READY_FILE_NO_MISSING_CLEANING(6).ipynb",
+  "classification": {
+    "Model": "Random Forest Classifier",
+    "Test_Records": 1000,
+    "Accuracy": 0.758,
+    "Precision_weighted": 0.7586,
+    "Recall_weighted": 0.758,
+    "F1_weighted": 0.7576,
+    "F1_macro": 0.5235,
+    "Balanced_accuracy": 0.5305
+  },
+  "regression": {
+    "Model": "Linear Regression",
+    "Test_Records": 1000,
+    "R_squared": 0.7687,
+    "MAE": 3.3244,
+    "RMSE": 4.9398
+  },
+  "feature_count": 38,
+  "runtime_validation_regression": {
+    "R_squared": 0.7688,
+    "MAE": 3.323,
+    "RMSE": 4.939
+  },
+  "verified_against_uploaded_notebook": "Final_notebook_by_pinky.ipynb",
+  "verification_date": "2026-06-19",
+  "streamlit_alignment_fix": "Preserve literal GLAZING_GROUP=None and use exact held-out Colab predictions for period evaluation."
+}
